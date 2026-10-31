@@ -2,6 +2,8 @@
 
 Run `dsh-control COMMAND [options]`. Request flags and a single JSON object on stdin are alternatives; do not mix them. JSON input is limited to 1 MiB. Unknown fields, repeated flags, incorrect types and conflicting selectors are rejected. Boolean JSON fields require booleans; turn/retry counts require nonnegative integers up to 1,000,000. Connection flags are separate from request fields and can accompany either form.
 
+Exit codes: `0` success, `2` nothing performed, `3` uncertain outcome. Each invocation prints one versioned JSON object.
+
 ## Shared options
 
 | Flag | Default / purpose |
@@ -103,3 +105,38 @@ printf '%s\n' '{"requestId":"<unique-id>","reconcile":true}' | dsh-control recei
 ```
 
 Legacy `wait` accepts `{"anchor":"<user-node-key>","context":{...}}` from the verified send state. It requires the exact user anchor and matching conversation/document identity; an unresolved anchor is unknown, never a reason to infer the latest turn. Prefer an exact session and verified request ID for new work.
+
+## Agent skill installation
+
+Run from the repository root. These are conventional local skill locations; configure only the agents you use. Existing files and links are left unchanged. Keep this checkout in place because the links point to it.
+
+```sh
+for directory in \
+  "$HOME/.agents/skills" \
+  "$HOME/.claude/skills" \
+  "$HOME/.cursor/skills" \
+  "$HOME/.config/opencode/skills" \
+  "$HOME/.codeium/windsurf/skills" \
+  "$HOME/.copilot/skills" \
+  "$HOME/.trae/skills" \
+  "$HOME/.gemini/config/skills" \
+  "$HOME/.gemini/antigravity-cli/skills" \
+  "$HOME/.pi/agent/skills"
+do
+  mkdir -p "$directory"
+  if [ ! -e "$directory/dsh-control" ] && [ ! -L "$directory/dsh-control" ]; then
+    ln -s "$PWD/skills/dsh-control" "$directory/dsh-control"
+  fi
+done
+```
+
+Reload your agent or start a fresh chat if it caches skills. A readable skill link does not establish activation in every agent. The executable and Harness app must be accessible on the same Mac. Agents controlling the same app must share the controller state directory.
+
+## Development checks
+
+Run Swift tests with `swift test`. Optional DOM tests require an already-installed Playwright and Chrome; replace both paths below:
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright-core/index.mjs \
+CHROME_PATH=/absolute/path/to/chrome node --test Tests/DOM/adapter.test.mjs
+```
