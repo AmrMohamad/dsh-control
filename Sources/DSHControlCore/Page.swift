@@ -25,6 +25,8 @@ public enum PageAdapter {
       const uiAvailable = !!root || legacy;
       const belongs = el => legacy || !!root && el.closest(occurrenceSelector) === root;
       const scoped = selector => [...document.querySelectorAll(selector)].filter(belongs);
+      // Nested child occurrences must not lend their running or interaction markers to an ancestor.
+      const inOccurrence = (el, occurrence) => !el.closest(occurrenceSelector) || el.closest(occurrenceSelector) === occurrence;
       const conversationSession = root?.getAttribute('data-conversation-session') || null;
       const displayedSessionId = mainRoots.length === 1 ? mainRoots[0].getAttribute('data-conversation-session') : null;
       const surface = root ? root.closest('[data-sidebar-chat]') ? 'sidebar' : 'main' : 'unknown';
@@ -82,9 +84,36 @@ public enum PageAdapter {
         kind:el.hasAttribute('data-approval-key') ? 'approval' : 'question',
         key:el.getAttribute('data-approval-key') ?? el.getAttribute('data-question-key'),text:cut(text(el),1500)}));
       const running = scoped('[data-chat-running],[data-streaming="true"]').some(shown) || buttons.some(el => inputArea?.contains(el) && name(el) === labels?.stop && !el.matches(':disabled,[aria-disabled="true"]'));
+      const runningIn = occurrence => [...occurrence.querySelectorAll('[data-chat-running],[data-streaming="true"]')].some(el => shown(el) && inOccurrence(el, occurrence)) ||
+        [...occurrence.querySelectorAll('button,[role="button"]')].some(el => shown(el) && inOccurrence(el, occurrence) && name(el) === labels?.stop && !el.matches(':disabled,[aria-disabled="true"]'));
+      const blockedIn = occurrence => [...occurrence.querySelectorAll('[data-approval-key],[data-question-key]')].some(el => shown(el) && inOccurrence(el, occurrence));
+      // A rendered occurrence is not loaded until real content exists and no placeholder phase is showing.
+      const placeholderPhases = new Set(['loading','settling']);
+      const hasLoadedContent = occurrence => !!occurrence && !placeholderPhases.has(occurrence.getAttribute('data-content-phase') || '') &&
+        (!!occurrence.querySelector('[data-composer-input],[data-composer-seat]') ||
+         [...occurrence.querySelectorAll('[data-chat-node-key]')].some(el => shown(el) && inOccurrence(el, occurrence)));
+      const loaded = legacy || hasLoadedContent(root);
       const menus = [...document.querySelectorAll('[role="menu"],[data-trigger-menu]')].filter(actionable);
-      const subagents = roots.filter(el => shown(el) && el.closest('[data-sidebar-chat]')).map(el => ({
-        id:el.getAttribute('data-conversation-session'),status:'unknown',uiAvailable:true})).filter(child => child.id);
+      const subagents = roots.filter(el => shown(el) && el.closest('[data-sidebar-chat]')).map(el => {
+        const active = runningIn(el), blocked = !active && blockedIn(el), childLoaded = hasLoadedContent(el);
+        return {id:el.getAttribute('data-conversation-session'),status:active?'running':blocked?'blocked':childLoaded?'idle':'unknown',
+          running:active?true:childLoaded&&!blocked?false:null,blocked,loaded:childLoaded,uiAvailable:true};
+      }).filter(child => child.id);
+      // The displayed main header's own "N subagents (running)" trigger is the supported aggregate
+      // child indicator. Sidebar targets have no aggregate of their own, so they stay unavailable.
+      const subagentActivity = (() => {
+        const unavailable = {available:false,running:false,declaredCount:null};
+        if (!root || surface !== 'main' || !displayedSessionId || displayedSessionId !== conversationSession) return unavailable;
+        const headers = [...document.querySelectorAll('header')].filter(el => shown(el) && !el.closest('[data-sidebar-chat]') && el.querySelector('[data-conversation-header-leading]'));
+        if (headers.length !== 1) return unavailable;
+        const pattern = /^(\d+)\s+(?:subagents?|个子智能体)(?:\s*(?:running|，正在运行))?$/;
+        const triggers = [...headers[0].querySelectorAll('button,[role="button"]')].filter(shown).map(el => {
+          const label = name(el), match = pattern.exec(label);
+          return match ? {label, count:Number(match[1])} : null;
+        }).filter(Boolean);
+        if (triggers.length !== 1) return unavailable;
+        return {available:true,running:/running|正在运行/.test(triggers[0].label),declaredCount:triggers[0].count,label:triggers[0].label};
+      })();
       const selectedRows = [...document.querySelectorAll('[data-row-key][aria-selected="true"]')].map(el => el.getAttribute('data-row-key')).sort();
       const navigation = controls.filter(control => control.current || (control.role === 'tab' && control.selected === 'true')).map(control => control.ref).sort();
       const context = buttons.filter(el => inputArea?.contains(el) && !reserved.has(name(el))).map(name);
@@ -129,7 +158,7 @@ public enum PageAdapter {
       // Navigation (click/scroll) may leave the chat view, where no composer exists; text actions need one.
       const composerAction = ['selectionReady','appendReady'].includes(request.action) || request.action !== 'scroll' && ['draft','send','cancel'].includes(request.purpose);
       const usable = composerAction ? supported : known && uiAvailable && editors.length <= 1;
-      const snapshot = {guard,supported,uiAvailable,session:{id:conversationSession ?? request.sessionId ?? null,sessionKind:surface==='sidebar'?'subagent':'unknown'},displayedSessionId,title,displayedTitle,attachmentCount,attachments,commands,references,viewKind,surface,composer,subagents,
+      const snapshot = {guard,supported,uiAvailable,loaded,session:{id:conversationSession ?? request.sessionId ?? null,sessionKind:surface==='sidebar'?'subagent':'unknown'},displayedSessionId,title,displayedTitle,attachmentCount,attachments,commands,references,viewKind,surface,composer,subagents,subagentActivity,
         language,status:dialogs.length||pendingInteractions.length?'blocked':running?'running':'idle',running,draft,editable,
         dialogs,alerts,notices,pendingInteractions,menus:menus.length,controls,messages,coverage:'rendered DOM only; virtualized history may be absent',
         capabilities:{inspect:true,draft:supported&&!composer.locked&&visible(editor)&&!dialogs.length&&!menus.length,

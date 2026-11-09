@@ -31,10 +31,10 @@ public struct UIController {
 
     public func close() { cdp.close() }
 
-    public mutating func inspect(sessionID: String? = nil) async throws -> JSONValue {
+    public mutating func inspect(sessionID: String? = nil, timeout: TimeInterval? = nil) async throws -> JSONValue {
         var request: [String: JSONValue] = ["action": .string("inspect")]
         if let sessionID { request["sessionId"] = .string(sessionID) }
-        var state = try Self.pageResult(try await page(request)).object ?? [:]
+        var state = try Self.pageResult(try await page(request, timeout: timeout)).object ?? [:]
         guard let guardValue = state["guard"], guardValue.object != nil else {
             throw ControlError(code: "unsupported_ui", message: "The page did not return its observed UI identity.")
         }
@@ -171,11 +171,11 @@ public struct UIController {
                 throw ControlError(code: "conversation_changed", message: "The displayed conversation changed while waiting.", details: state)
             }
             if state["status"]?.string == "blocked" {
-                return .object(["outcome": .string("blocked"), "state": state])
+                return .object(["outcome": .string("blocked"), "completionScope": .string("turn"), "state": state])
             }
             let messages = state["messages"]?.array ?? []
             if state["running"]?.bool == false, Self.completed(messages: messages, anchor: anchor) {
-                return .object(["outcome": .string("settled"), "state": state])
+                return .object(["outcome": .string("settled"), "completionScope": .string("turn"), "state": state])
             }
             if Date() >= deadline {
                 throw ControlError(code: "wait_timeout", message: "A final result was not confirmed in the rendered UI. No prompt was retried.", outcome: "unknown", details: state)
@@ -249,8 +249,8 @@ public struct UIController {
         return observed == requested || (requested.hasSuffix("\n") && observed == requested + "\n")
     }
 
-    mutating func page(_ request: [String: JSONValue]) async throws -> JSONValue {
-        try await cdp.evaluate(expression: "(\(PageAdapter.script))(\(String(decoding: try JSONValue.object(request).encoded(), as: UTF8.self)))")
+    mutating func page(_ request: [String: JSONValue], timeout: TimeInterval? = nil) async throws -> JSONValue {
+        try await cdp.evaluate(expression: "(\(PageAdapter.script))(\(String(decoding: try JSONValue.object(request).encoded(), as: UTF8.self)))", timeout: timeout)
     }
 
     static func pageResult(_ value: JSONValue) throws -> JSONValue {

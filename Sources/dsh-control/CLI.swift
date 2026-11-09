@@ -21,8 +21,11 @@ struct CLI {
               set-access-mode --mode MODE [--confirm-risk]
     Mutations require --expect TOKEN. new-session/send/send-and-wait require --request-id ID.
     send [--file FILE] [--long-brief attach|reference] [--allow-slash] [--allow-references]
-    send-and-wait uses the same send flags, then waits without holding the mutation lock.
-    wait --session ID [--request-id ID|--input-id ID|--turn N] [--retry-transient N]
+    send-and-wait uses the same send flags (plus --until idle), then waits without holding the mutation lock.
+    wait --session ID [--request-id ID|--input-id ID|--turn N|--until idle] [--retry-transient N]
+    Default waits settle the exact bound turn (completionScope "turn"). --until idle instead
+    observes live parent, queued-input, interaction and known-child quiescence; it needs the
+    trusted GUI debugger and reports completionScope "idle" with evidence and coverage.
     receipt --request-id ID [--reconcile]; cancel --expect TOKEN [--include-subagents]
 
     inspect/read/start/quit need no stdin. Other commands read one JSON object:
@@ -81,10 +84,14 @@ struct CLI {
         if ["read", "status", "changes"].contains(command), let id = request["session"]?.string {
             return try observed(command: command, request: request, sessionID: id, store: store)
         }
-        if command == "wait", let id = request["session"]?.string {
+        if command == "wait", let id = request["session"]?.string, request["until"]?.string != CommandOptions.idleUntil {
             return try await wait(request: request, sessionID: id, options: options, store: store)
         }
-        let application = try HarnessApplication(bundleURL: options.app)
+        let idleWait = command == "wait" && request["until"]?.string == CommandOptions.idleUntil
+        let idleDeadline = idleWait ? ContinuousClock.now.advanced(by: .seconds(options.timeout)) : nil
+        let application: HarnessApplication
+        do { application = try HarnessApplication(bundleURL: options.app) }
+        catch let error as ControlError where idleWait { throw Self.idleUnavailable(error) }
         if command == "start" || command == "quit" {
             let lock = try MutationLock(directory: options.state)
             defer { withExtendedLifetime(lock) {} }
@@ -94,7 +101,9 @@ struct CLI {
             }
             return result
         }
-        var controller = try await UIController.connect(application: application, port: options.port, timeout: options.timeout)
+        var controller: UIController
+        do { controller = try await UIController.connect(application: application, port: options.port, timeout: Self.remaining(idleDeadline) ?? options.timeout) }
+        catch let error as ControlError where idleWait { throw Self.idleUnavailable(error) }
         defer { controller.close() }
         if ["inspect", "read", "status", "changes"].contains(command) {
             var state = try await controller.inspect(sessionID: request["session"]?.string)
@@ -128,6 +137,13 @@ struct CLI {
             return try ObservationOutput.inspect(state, compact: request["compact"]?.bool == true, fields: request["fields"]?.string, controls: request["controls"]?.string)
         }
         if command == "wait" {
+            let untilIdle = request["until"]?.string == CommandOptions.idleUntil
+            let runtime: SessionWaiter.IdleRuntimeObservation? = untilIdle
+                ? { sessionID, remaining in try await controller.inspect(sessionID: sessionID, timeout: remaining) } : nil
+            if let id = request["session"]?.string {
+                return try await wait(request: request, sessionID: id, options: options, store: store,
+                                      runtime: runtime, deadline: idleDeadline)
+            }
             guard let context = request["context"], context.object != nil else { throw ControlError(code: "invalid_request", message: "Wait needs --session ID or the legacy anchor/context request.") }
             if let id = context["conversationSession"]?.string {
                 var values = request.object!; values["session"] = .string(id)
@@ -141,7 +157,8 @@ struct CLI {
                     throw ControlError(code: "invalid_anchor", message: "The legacy user anchor cannot be resolved in its bound session. Use the send receipt; do not infer the latest turn.", outcome: "unknown")
                 }
                 values["turn"] = .number(turn)
-                return try await wait(request: .object(values), sessionID: id, options: options, store: store)
+                return try await wait(request: .object(values), sessionID: id, options: options, store: store,
+                                      runtime: runtime, deadline: idleDeadline)
             }
             return try await controller.wait(anchor: request.requireString("anchor"), context: context, timeout: options.timeout)
         }
@@ -184,11 +201,13 @@ struct CLI {
         }
         var values = request.object!
         values["requestId"] = receipt["requestId"]
+        let runtime: SessionWaiter.IdleRuntimeObservation? = request["until"]?.string == CommandOptions.idleUntil
+            ? { sessionID, remaining in try await controller.inspect(sessionID: sessionID, timeout: remaining) } : nil
         do {
-            let waited = try await wait(request: .object(values), sessionID: id, options: options, store: store)
+            let waited = try await wait(request: .object(values), sessionID: id, options: options, store: store, runtime: runtime)
             return .object(["send": result, "wait": waited])
-        } catch let error as ControlError {
-            throw ControlError(code: error.code, message: error.message, outcome: "unknown", details: .object(["send": result, "waitError": .string(error.code)]))
+        } catch {
+            throw ControlError.sendWaitFailure(error, send: result)
         }
     }
 
@@ -201,7 +220,11 @@ struct CLI {
         return value
     }
 
-    static func wait(request: JSONValue, sessionID: String, options: CommandOptions, store: SessionStore) async throws -> JSONValue {
+    static func wait(request: JSONValue, sessionID: String, options: CommandOptions, store: SessionStore,
+                     runtime: SessionWaiter.IdleRuntimeObservation? = nil,
+                     deadline: ContinuousClock.Instant? = nil) async throws -> JSONValue {
+        let untilIdle = request["until"]?.string == CommandOptions.idleUntil
+        let waitDeadline = deadline ?? (untilIdle ? ContinuousClock.now.advanced(by: .seconds(options.timeout)) : nil)
         var input = request["inputId"]?.string
         var turn = request["turn"]
         if let id = request["requestId"]?.string {
@@ -212,6 +235,10 @@ struct CLI {
             input = receipt["verification"]?["inputId"]?.string
             turn = receipt["verification"]?["turn"]
             if receipt["submission"]?["operation"]?.string == "command", let commandID = receipt["verification"]?["commandId"]?.string {
+                if untilIdle {
+                    throw ControlError(code: "invalid_request", message: "Idle waiting needs a model-turn receipt; this receipt is a command completion with no continuation turn. No input was retried.",
+                                       outcome: "unknown", details: receipt)
+                }
                 return try await SessionWaiter.wait(store: store, sessionID: sessionID, commandID: commandID, timeout: options.timeout, retryTransient: Int(request["retryTransient"]?.number ?? 3))
             }
             if input == nil && turn == nil, let submission = receipt["submission"], let evidence = try store.admission(sessionID: sessionID, after: submission["cursor"] ?? .null, digest: submission.requireString("digest"), operation: submission["operation"]?.string ?? "send") {
@@ -220,7 +247,26 @@ struct CLI {
             if turn == .null { turn = nil }
             guard input != nil || turn != nil else { throw ControlError(code: "invalid_anchor", message: "Submission is verified but its durable turn is not yet identified. Read/reconcile the receipt; do not resend.", outcome: "unknown", details: receipt) }
         }
+        if untilIdle {
+            return try await SessionWaiter.waitForIdle(store: store, sessionID: sessionID, inputID: input, turn: turn,
+                                                       timeout: Self.remaining(waitDeadline) ?? options.timeout,
+                                                       retryTransient: Int(request["retryTransient"]?.number ?? 3), runtime: runtime)
+        }
         return try await SessionWaiter.wait(store: store, sessionID: sessionID, inputID: input, turn: turn, timeout: options.timeout, retryTransient: Int(request["retryTransient"]?.number ?? 3))
+    }
+
+    /// Remaining time before one absolute deadline; never a fresh per-observation budget.
+    static func remaining(_ deadline: ContinuousClock.Instant?) -> TimeInterval? {
+        guard let deadline else { return nil }
+        let duration = ContinuousClock.now.duration(to: deadline)
+        let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        return max(0.001, seconds)
+    }
+
+    static func idleUnavailable(_ error: ControlError) -> ControlError {
+        ControlError(code: "idle_unavailable",
+                     message: "Idle waiting requires a trusted, running GUI observation connection. \(error.message)",
+                     outcome: "unknown", details: .object(["cause": .string(error.code)]))
     }
 
     static func output(_ value: JSONValue) throws {

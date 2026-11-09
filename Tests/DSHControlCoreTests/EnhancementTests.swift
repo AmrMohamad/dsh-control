@@ -80,6 +80,55 @@ private struct EnhancementSession {
         if let reason { events.append(("turn/end", .object(["turn": turn, "reason": .object(["kind": .string(reason)])]))) }
         return events
     }
+
+    /// A child/agent-driven turn has no human-sourced user message, so it continues the bound input.
+    func continuation(_ number: Int, reply: String, reason: String? = "completed") -> [(String, JSONValue)] {
+        let turn = JSONValue.number(Double(number))
+        var events: [(String, JSONValue)] = [
+            ("turn/start", .object(["turn": turn])),
+            ("user/message", .object(["role": .string("user"), "id": .string("child-message-" + reply), "source": .object(["kind": .string("agent")]),
+                "content": .array([.object(["type": .string("text"), "text": .string("child report " + reply)])])])),
+            ("assistant/message", .object(["turn": turn, "step": .number(1), "stream": .array([]),
+                "message": .object(["role": .string("assistant"), "id": .string("answer-" + reply), "source": .object(["kind": .string("model")]),
+                    "content": .array([.object(["type": .string("text"), "text": .string(reply)])])])]))
+        ]
+        if let reason { events.append(("turn/end", .object(["turn": turn, "reason": .object(["kind": .string(reason)])]))) }
+        return events
+    }
+
+    func childCatalog(_ childID: String, mode: String = "one-shot") -> (String, JSONValue) {
+        ("subagent/catalog", .object(["version": .number(mode == "external" ? 2 : 0), "childId": .string(childID),
+                                      "childCreatedAt": .number(1), "mode": .string(mode), "label": .string("Helper")]))
+    }
+}
+
+/// A synthetic inspect-shaped observation for the exact session; never a mutation request.
+private func idleRuntimeState(_ sessionID: String, running: Bool = false, status: String? = nil,
+                              subagents: [JSONValue] = [], aggregate: JSONValue? = nil,
+                              pendingInteractions: [JSONValue] = [], uiAvailable: Bool = true,
+                              observedSessionID: String? = nil, contentPhase: String? = "active",
+                              loaded: Bool = true) -> JSONValue {
+    let id = observedSessionID ?? sessionID
+    return .object([
+        "uiAvailable": .bool(uiAvailable),
+        "loaded": .bool(loaded),
+        "session": .object(["id": .string(id)]),
+        "guard": .object(["conversationSession": .string(id), "contentPhase": contentPhase.map(JSONValue.string) ?? .null]),
+        "running": .bool(running),
+        "status": .string(status ?? (running ? "running" : "idle")),
+        "pendingInteractions": .array(pendingInteractions),
+        "subagents": .array(subagents),
+        "subagentActivity": aggregate ?? .object(["available": .bool(false), "running": .bool(false), "declaredCount": .null]),
+    ])
+}
+
+private func idleChild(_ id: String, status: String) -> JSONValue {
+    .object(["id": .string(id), "status": .string(status), "running": .bool(status == "running"),
+             "blocked": .bool(status == "blocked"), "loaded": .bool(true), "uiAvailable": .bool(true)])
+}
+
+private func idleAggregate(running: Bool, count: Int) -> JSONValue {
+    .object(["available": .bool(true), "running": .bool(running), "declaredCount": .number(Double(count))])
 }
 
 @Suite struct EnhancementTests {
@@ -222,6 +271,7 @@ private struct EnhancementSession {
         for (input, turn) in [("first" as String?, nil as JSONValue?), (nil, JSONValue.number(1))] {
             let result = try await SessionWaiter.wait(store: fixture.store, sessionID: "enhancement", inputID: input, turn: turn, timeout: 0)
             #expect(result["outcome"] == .string("settled") && result["turn"] == .number(1))
+            #expect(result["completionScope"] == .string("turn"))
             #expect(result["reply"]?["messages"]?.array?.first?["body"] == .string("FIRST"))
         }
     }
@@ -253,11 +303,11 @@ private struct EnhancementSession {
             ("approval/asked", .object(["id": .string("approval"), "toolName": .string("bash")]))
         ])
         let blocked = try await SessionWaiter.wait(store: fixture.store, sessionID: "enhancement", inputID: "target", timeout: 0)
-        #expect(blocked["outcome"] == .string("blocked"))
+        #expect(blocked["outcome"] == .string("blocked") && blocked["completionScope"] == .string("turn"))
         #expect(blocked["state"]?["pendingInteractions"]?.array?.first?["runtimeConfirmed"] == .bool(false))
         try fixture.write(fixture.turn(1, input: "target", reply: "PARTIAL", reason: "interrupted"))
         let terminated = try await SessionWaiter.wait(store: fixture.store, sessionID: "enhancement", inputID: "target", timeout: 0)
-        #expect(terminated["outcome"] == .string("terminated"))
+        #expect(terminated["outcome"] == .string("terminated") && terminated["completionScope"] == .string("turn"))
         #expect(terminated["reason"]?["kind"] == .string("interrupted"))
     }
 
@@ -287,5 +337,308 @@ private struct EnhancementSession {
         let result = try await SessionWaiter.wait(store: fixture.store, sessionID: "enhancement", commandID: "target", timeout: 0)
         #expect(result["outcome"] == .string("command_settled"))
         #expect(result["commandId"] == .string("target"))
+    }
+
+    @Test func idleWaitReturnsContinuationTurnNotTheInitialParentSummary() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST") + fixture.continuation(2, reply: "CONTINUATION"))
+        let result = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 5,
+            runtime: { id, _ in idleRuntimeState(id) })
+        #expect(result["outcome"] == .string("settled"))
+        #expect(result["completionScope"] == .string("idle"))
+        #expect(result["turn"] == .number(2))
+        #expect(result["originalTurn"] == .number(1))
+        #expect(result["inputId"] == .string("first"))
+        #expect(result["reply"]?["messages"]?.array?.first?["body"] == .string("CONTINUATION"))
+        #expect(result["evidence"]?["children"]?["complete"] == .bool(true))
+        #expect(result["evidence"]?["coverage"]?.string?.contains("Observed idle") == true)
+    }
+
+    @Test func idleWaitReportsTerminatedContinuationTurn() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST") +
+            fixture.continuation(2, reply: "PARTIAL", reason: "interrupted"))
+        let result = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 5,
+            runtime: { id, _ in idleRuntimeState(id) })
+        #expect(result["outcome"] == .string("terminated") && result["completionScope"] == .string("idle"))
+        #expect(result["turn"] == .number(2) && result["reason"]?["kind"] == .string("interrupted"))
+    }
+
+    @Test func idleWaitDoesNotSettleWhenParentTurnEndedButRuntimeIsActive() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, running: true) })
+            Issue.record("Reported idle while the parent runtime was running")
+        } catch let error as ControlError {
+            #expect(error.code == "wait_timeout" && error.outcome == "unknown")
+        }
+    }
+
+    @Test func idleWaitDoesNotSettleWhileTheParentContentIsSettling() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, contentPhase: "settling") })
+            Issue.record("Reported idle while the displayed content was still settling")
+        } catch let error as ControlError { #expect(error.code == "wait_timeout") }
+    }
+
+    @Test func idleWaitDoesNotSettleWhileAKnownChildIsActive() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write([fixture.childCatalog("child")] + fixture.turn(1, input: "first", reply: "FIRST"))
+        for runtime in [
+            idleRuntimeState("enhancement", subagents: [idleChild("child", status: "running")], aggregate: idleAggregate(running: true, count: 1)),
+            idleRuntimeState("enhancement", subagents: [idleChild("child", status: "blocked")], aggregate: idleAggregate(running: false, count: 1)),
+        ] {
+            do {
+                _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                    runtime: { _, _ in runtime })
+                Issue.record("Reported idle while a known child was active")
+            } catch let error as ControlError { #expect(error.code == "wait_timeout") }
+        }
+    }
+
+    @Test func idleWaitHonorsAggregateChildActivityAbsentFromTheCatalog() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, aggregate: idleAggregate(running: true, count: 2)) })
+            Issue.record("Ignored the displayed aggregate child-running indicator")
+        } catch let error as ControlError { #expect(error.code == "wait_timeout") }
+    }
+
+    @Test func idleWaitUsesSupportedAggregateChildEvidenceAndRejectsMissingEvidence() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write([fixture.childCatalog("child")] + fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id) })
+            Issue.record("Treated an unobservable known child as zero active children")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable") }
+        let settled = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 5,
+            runtime: { id, _ in idleRuntimeState(id, aggregate: idleAggregate(running: false, count: 1)) })
+        #expect(settled["outcome"] == .string("settled"))
+        #expect(settled["evidence"]?["children"]?["source"] == .string("aggregate_indicator"))
+        #expect(settled["evidence"]?["children"]?["complete"] == .bool(true))
+        #expect(settled["reply"]?["messages"]?.array?.first?["body"] == .string("FIRST"))
+    }
+
+    @Test func idleWaitNeverTreatsAnExternalChildAsObservedIdle() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write([fixture.childCatalog("external-child", mode: "external")] + fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, aggregate: idleAggregate(running: false, count: 1)) })
+            Issue.record("Counted an external child's liveness as zero")
+        } catch let error as ControlError {
+            #expect(error.code == "idle_unavailable")
+            #expect(error.details?["state"]?["subagents"]?.array?.first?["mode"] == .string("external"))
+        }
+    }
+
+    @Test func idleWaitDoesNotCountUnknownChildObservationAsIdle() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write([fixture.childCatalog("child")] + fixture.turn(1, input: "first", reply: "FIRST"))
+        let unknown: JSONValue = .object(["id": .string("child"), "status": .string("unknown"), "uiAvailable": .bool(true)])
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, subagents: [unknown]) })
+            Issue.record("Treated a present-but-unknown child as observed idle")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable") }
+    }
+
+    @Test func idleWaitDoesNotAuthorizeIdleFromAnUnloadedParentOccurrence() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, loaded: false) })
+            Issue.record("Trusted an unloaded parent occurrence as observed idle")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable") }
+    }
+
+    @Test func idleWaitReobservesWhenTheDurableCursorChangedDuringRuntimeIO() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let initial = fixture.turn(1, input: "first", reply: "FIRST")
+        let extended = initial + fixture.continuation(2, reply: "CONTINUATION")
+        try fixture.write(initial)
+        var calls = 0
+        let result = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 5,
+            runtime: { id, _ in
+                calls += 1
+                if calls == 1 { try fixture.write(extended) }
+                return idleRuntimeState(id)
+            })
+        #expect(calls >= 2)
+        #expect(result["outcome"] == .string("settled"))
+        #expect(result["turn"] == .number(2))
+        #expect(result["reply"]?["messages"]?.array?.first?["body"] == .string("CONTINUATION"))
+    }
+
+    @Test func idleWaitDoesNotPublishFromAStaleCursorWithAPendingTail() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        var calls = 0
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0.5,
+                runtime: { id, _ in
+                    calls += 1
+                    if calls == 1 {
+                        // A partial final record leaves the committed cursor unchanged but makes the reread pending.
+                        let handle = try FileHandle(forWritingTo: fixture.path)
+                        _ = try handle.seekToEnd()
+                        try handle.write(contentsOf: Data(#"{"type":"turn/start""#.utf8))
+                        try handle.close()
+                    }
+                    return idleRuntimeState(id)
+                })
+            Issue.record("Published idle from a reread whose incomplete tail left running unknown")
+        } catch let error as ControlError {
+            #expect(error.code == "wait_timeout" && error.outcome == "unknown")
+        }
+        #expect(calls == 1)
+        #expect(try fixture.store.snapshot(sessionID: "enhancement")["observation"]?["pendingTail"] == .bool(true))
+    }
+
+    @Test func idleWaitNeverPublishesAnObservationAfterTheDeadline() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0.05,
+                runtime: { id, _ in
+                    try await Task.sleep(for: .milliseconds(200))
+                    return idleRuntimeState(id)
+                })
+            Issue.record("Published an idle observation obtained after the deadline")
+        } catch let error as ControlError {
+            #expect(error.code == "wait_timeout" && error.outcome == "unknown")
+        }
+    }
+
+    @Test func idleWaitDoesNotObserveAViewThatSwitchedSessions() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id, observedSessionID: "another-session") })
+            Issue.record("Treated another conversation's idle state as this session's")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable" && error.outcome == "unknown") }
+    }
+
+    @Test func idleWaitReportsUnavailableRuntimeInsteadOfFallingBackToTurnSettled() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0, runtime: nil)
+            Issue.record("Fell back to recorded turn completion without runtime evidence")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable" && error.outcome == "unknown") }
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { _, _ -> JSONValue in throw ControlError(code: "transport", message: "closed") })
+            Issue.record("Invented idle from a failed runtime observation")
+        } catch let error as ControlError { #expect(error.code == "idle_unavailable") }
+    }
+
+    @Test func idleWaitConsidersQueuedInputAndPendingInteractions() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        let queued: JSONValue = .object(["role": .string("user"), "id": .string("follow-up"), "source": .object(["kind": .string("user")]),
+            "content": .array([.object(["type": .string("text"), "text": .string("later")])])])
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST") +
+            [("agent/inbox/spliced", .object(["target": .string("next-turn"), "start": .number(0), "inserted": .array([queued])]))])
+        var runtimeCalls = 0
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in runtimeCalls += 1; return idleRuntimeState(id) })
+            Issue.record("Reported idle with queued input")
+        } catch let error as ControlError { #expect(error.code == "wait_timeout") }
+        #expect(runtimeCalls == 0)
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST") + [
+            ("approval/asked", .object(["id": .string("approval"), "toolName": .string("bash")]))])
+        let blocked = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+            runtime: { id, _ in idleRuntimeState(id) })
+        #expect(blocked["outcome"] == .string("blocked") && blocked["completionScope"] == .string("turn"))
+        #expect(blocked["until"] == .string("idle"))
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        let observed = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+            runtime: { id, _ in idleRuntimeState(id, pendingInteractions: [.object(["kind": .string("approval"), "key": .string("live")])]) })
+        #expect(observed["outcome"] == .string("blocked") && observed["reason"] == .string("observed_pending_interaction"))
+        #expect(observed["until"] == .string("idle"))
+    }
+
+    @Test func idleWaitIdentifiesALaterHumanTurnAsOutOfScope() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST") + fixture.turn(2, input: "follow-up", reply: "LATER"))
+        do {
+            _ = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 0,
+                runtime: { id, _ in idleRuntimeState(id) })
+            Issue.record("Returned a later human request as this input's completion")
+        } catch let error as ControlError {
+            #expect(error.code == "scope_boundary" && error.outcome == "unknown")
+            #expect(error.details?["boundary"]?["turn"] == .number(2))
+            #expect(error.details?["boundaryInputId"] == .string("follow-up"))
+            #expect(error.details?["turn"] == .number(1))
+        }
+    }
+
+    @Test func idleObservationIsReadOnlyAndKeepsTheSendEvidenceContract() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        let before = try Data(contentsOf: fixture.path)
+        var observedSessions: [String] = []
+        let result = try await SessionWaiter.waitForIdle(store: fixture.store, sessionID: "enhancement", inputID: "first", timeout: 5,
+            runtime: { id, _ in observedSessions.append(id); return idleRuntimeState(id) })
+        #expect(result["outcome"] == .string("settled"))
+        #expect(observedSessions == ["enhancement"])
+        #expect(try Data(contentsOf: fixture.path) == before)
+        let send: JSONValue = .object(["outcome": .string("verified"), "receipt": .object(["requestId": .string("send-1")])])
+        let failure = ControlError.sendWaitFailure(ControlError(code: "wait_timeout", message: "late", outcome: "unknown"), send: send)
+        #expect(failure.code == "wait_timeout" && failure.outcome == "unknown" && failure.details?["send"] == send)
+        #expect(failure.details?["waitError"] == .string("wait_timeout"))
+        let cancelled = ControlError.sendWaitFailure(CancellationError(), send: send)
+        #expect(cancelled.code == "cancelled" && cancelled.outcome == "unknown" && cancelled.details?["send"] == send)
+    }
+
+    @Test func idleWaitRemainsCancellable() async throws {
+        let fixture = try EnhancementSession(); defer { try? FileManager.default.removeItem(at: fixture.home) }
+        try fixture.write(fixture.turn(1, input: "first", reply: "FIRST"))
+        let store = fixture.store
+        let task = Task {
+            try await SessionWaiter.waitForIdle(store: store, sessionID: "enhancement", inputID: "first", timeout: 30,
+                runtime: { id, _ in idleRuntimeState(id, running: true) })
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+        do { _ = try await task.value; Issue.record("Idle wait ignored cancellation") }
+        catch { #expect(error is CancellationError) }
+    }
+
+    @Test func untilIdleIsValidatedBeforeAnyAppEffect() throws {
+        let wait = try CommandOptions(arguments: ["wait", "--session", "s", "--until", "idle"])
+        #expect(wait.request["until"] == .string("idle"))
+        let legacy = try CommandOptions(arguments: ["wait"],
+            stdin: Data(#"{"until":"idle","context":{"conversationSession":"s"}}"#.utf8))
+        #expect(legacy.request["until"] == .string("idle"))
+        for text in [#"{"until":"idle","context":{}}"#, #"{"until":"idle","context":{"conversationSession":""}}"#,
+                     #"{"until":"idle","context":{"lastUser":"u"}}"#, #"{"until":"idle"}"#] {
+            #expect(throws: ControlError.self) { try CommandOptions(arguments: ["wait"], stdin: Data(text.utf8)) }
+        }
+        let sendWait = try CommandOptions(arguments: ["send-and-wait", "--expect", "e", "--request-id", "r", "--until", "idle"])
+        #expect(sendWait.request["until"] == .string("idle"))
+        for arguments in [
+            ["wait", "--session", "s", "--until", "busy"],
+            ["wait", "--session", "s", "--until", "idle", "--turn", "1"],
+            ["wait", "--until", "idle"],
+            ["send-and-wait", "--expect", "e", "--request-id", "r", "--until", "later"],
+            ["send", "--expect", "e", "--request-id", "r", "--until", "idle"],
+        ] {
+            #expect(throws: ControlError.self) { try CommandOptions(arguments: arguments) }
+        }
+        for text in [#"{"until":1}"#, #"{"until":true}"#, #"{"until":"idle","turn":1}"#] {
+            #expect(throws: ControlError.self) { try CommandOptions(arguments: ["wait", "--session", "s"], stdin: Data(text.utf8)) }
+        }
     }
 }

@@ -16,9 +16,9 @@ public struct CommandOptions {
         "status": ["session"], "changes": ["session", "turn", "diff"],
         "draft": ["expect", "text", "session"], "click": ["expect", "ref", "session"],
         "send": ["expect", "requestId", "session", "file", "longBrief", "allowSlash", "allowReferences"],
-        "send-and-wait": ["expect", "requestId", "session", "file", "longBrief", "allowSlash", "allowReferences", "retryTransient"],
+        "send-and-wait": ["expect", "requestId", "session", "file", "longBrief", "allowSlash", "allowReferences", "retryTransient", "until"],
         "cancel": ["expect", "session", "includeSubagents"], "scroll": ["expect", "session", "direction"],
-        "wait": ["session", "anchor", "context", "requestId", "turn", "inputId", "followSession", "retryTransient"],
+        "wait": ["session", "anchor", "context", "requestId", "turn", "inputId", "followSession", "retryTransient", "until"],
         "receipt": ["requestId", "reconcile"],
         "new-session": ["expect", "requestId", "workspace", "workspaceId", "cwd", "title"],
         "select-session": ["expect", "id", "title"], "release-session": ["expect", "id", "requestId"],
@@ -35,8 +35,11 @@ public struct CommandOptions {
         "--direction": "direction", "--anchor": "anchor", "--input-id": "inputId", "--turn": "turn", "--since": "since",
         "--fields": "fields", "--controls": "controls", "--out": "out", "--file": "file", "--long-brief": "longBrief",
         "--retry-transient": "retryTransient", "--workspace": "workspace", "--workspace-id": "workspaceId", "--cwd": "cwd",
-        "--title": "title", "--id": "id", "--model": "model", "--provider": "provider", "--effort": "effort", "--mode": "mode"
+        "--title": "title", "--id": "id", "--model": "model", "--provider": "provider", "--effort": "effort", "--mode": "mode",
+        "--until": "until"
     ]
+    /// The only non-default wait boundary; absence keeps the exact-turn contract.
+    public static let idleUntil = "idle"
 
     public init(arguments: [String], stdin: Data? = nil) throws {
         guard let command = arguments.first, let allowed = Self.allowed[command] else { throw ControlError(code: "usage", message: "Unknown command. Run dsh-control --help.") }
@@ -93,6 +96,15 @@ public struct CommandOptions {
             guard let value = values[key]?.string, key == "text" || !value.isEmpty else { throw ControlError(code: "invalid_request", message: "Missing string field: \(key).") }
         }
         guard values["turn"] == nil || values["since"] == nil else { throw ControlError(code: "usage", message: "--turn and --since are mutually exclusive.") }
+        if let until = values["until"] {
+            guard until.string == Self.idleUntil else { throw ControlError(code: "invalid_request", message: "until supports only \"idle\".") }
+            guard values["turn"] == nil else { throw ControlError(code: "usage", message: "An exact --turn cannot also wait for idle; choose one completion scope.") }
+            if command == "wait", values["session"] == nil {
+                guard let bound = values["context"]?["conversationSession"]?.string, !bound.isEmpty else {
+                    throw ControlError(code: "usage", message: "--until idle requires --session ID or a legacy context with a nonempty conversationSession.")
+                }
+            }
+        }
         if command == "wait" {
             let selectors = ["requestId", "inputId", "turn"].filter { values[$0] != nil }
             guard selectors.count <= 1 else { throw ControlError(code: "usage", message: "Choose one wait selector: requestId, inputId or turn.") }

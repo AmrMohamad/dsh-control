@@ -32,7 +32,9 @@ public struct CDP {
         session.invalidateAndCancel()
     }
 
-    public mutating func call(method: String, params: JSONValue = .object([:])) async throws -> JSONValue {
+    public mutating func call(method: String, params: JSONValue = .object([:]), timeout: TimeInterval? = nil) async throws -> JSONValue {
+        let budget: TimeInterval
+        if let timeout, timeout.isFinite, timeout > 0 { budget = min(self.timeout, timeout) } else { budget = self.timeout }
         nextID += 1
         let id = nextID
         let request = try JSONValue.object(["id": .number(Double(id)), "method": .string(method), "params": params]).encoded()
@@ -43,7 +45,7 @@ public struct CDP {
             session.invalidateAndCancel()
         }
         do {
-            return try await withDeadline(seconds: timeout, cancel: cancel) {
+            return try await withDeadline(seconds: budget, cancel: cancel) {
                 try await socket.send(.string(String(decoding: request, as: UTF8.self)))
                 while true {
                     let message = try await socket.receive()
@@ -64,10 +66,10 @@ public struct CDP {
         }
     }
 
-    public mutating func evaluate(expression: String) async throws -> JSONValue {
+    public mutating func evaluate(expression: String, timeout: TimeInterval? = nil) async throws -> JSONValue {
         let response = try await call(method: "Runtime.evaluate", params: .object([
             "expression": .string(expression), "returnByValue": .bool(true), "awaitPromise": .bool(true),
-        ]))
+        ]), timeout: timeout)
         return try evaluationValue(response)
     }
 }

@@ -201,7 +201,8 @@ test('parent and child occurrences isolate editors, messages, running and intera
   assert.deepEqual(parent.pendingInteractions, []);
   assert.equal(parent.composer.locked, false);
   assert.equal(parent.capabilities.send, true);
-  assert.deepEqual(parent.subagents.map(agent => [agent.id, agent.status]), [['child', 'unknown']]);
+  assert.deepEqual(parent.subagents.map(agent => [agent.id, agent.status]), [['child', 'running']]);
+  assert.equal(parent.subagents[0].loaded, true);
   const selected = await run(html, { action: 'inspect', sessionId: 'child' });
   assert.equal(selected.result.session.id, 'child');
   assert.equal(selected.result.displayedSessionId, 'parent');
@@ -402,4 +403,50 @@ test('attachment and chip metadata bind guards and refuse generic sends with inl
   assert.equal(referenced.snapshot.capabilities.send, false);
   assert.equal(code(referenced), 'unsupported_command');
   assert.equal((await run(chips, { action: 'prepare', purpose: 'send', allowReferences: true })).result.error, undefined);
+});
+
+const header = label => `<header><div data-conversation-header-leading></div><button aria-haspopup="tree" aria-label="${label}">${label}</button></header>`;
+
+test('scoped child running indicators and the aggregate subagent trigger are live observation only', async () => {
+  const p = await browser.newPage();
+  try {
+    const html = page(occurrence('parent', header('2 subagents running') + composer() +
+      child(composer().replace('>hi</div>', '>child draft</div>') + '<div data-chat-running>Working</div>') +
+      '<aside data-sidebar-chat>' + occurrence('child-2', composer()) + '</aside>'));
+    await p.setContent(html);
+    const call = req => p.evaluate(`((location, performance) => (${script}))({origin:'dsh-app://app',href:'dsh-app://app/'},{timeOrigin:1})(${JSON.stringify(req)})`);
+    const before = await p.evaluate(() => document.body.innerHTML);
+    const parent = await call({ action: 'inspect' });
+    const after = await p.evaluate(() => document.body.innerHTML);
+    assert.equal(after, before);
+    assert.deepEqual(parent.subagentActivity, { available: true, running: true, declaredCount: 2, label: '2 subagents running' });
+    assert.deepEqual(parent.subagents.map(agent => [agent.id, agent.status, agent.loaded]), [['child', 'running', true], ['child-2', 'idle', true]]);
+    assert.equal(parent.running, false);
+    assert.equal(parent.guard.running, false);
+    const sidebar = await call({ action: 'inspect', sessionId: 'child' });
+    assert.equal(sidebar.subagentActivity.available, false);
+    assert.equal(sidebar.running, true);
+  } finally { await p.close(); }
+});
+
+test('aggregate subagent trigger without the running qualifier reports observed child idle', async () => {
+  const html = page(occurrence('parent', header('2 subagents') + composer() + child(composer())));
+  const { result } = await run(html, { action: 'inspect' });
+  assert.deepEqual(result.subagentActivity, { available: true, running: false, declaredCount: 2, label: '2 subagents' });
+  assert.deepEqual(result.subagents.map(agent => [agent.id, agent.status]), [['child', 'idle']]);
+});
+
+test('a settling child placeholder stays unknown instead of inferred idle', async () => {
+  const section = (content, phase) => `<aside data-sidebar-chat><section data-conversation-content data-conversation-session="child" data-content-phase="${phase}">${content}</section></aside>`;
+  const html = page(occurrence('parent', composer()) + section('<div role="status">Loading</div>', 'settling'));
+  const parent = await run(html, { action: 'inspect' });
+  assert.deepEqual(parent.snapshot.subagents.map(agent => [agent.id, agent.status, agent.running, agent.loaded]),
+    [['child', 'unknown', null, false]]);
+  const child = await run(html, { action: 'inspect', sessionId: 'child' });
+  assert.equal(child.result.uiAvailable, true);
+  assert.equal(child.result.loaded, false);
+  assert.equal(child.result.running, false);
+  // Positive running evidence outranks an unloaded phase.
+  const live = await run(page(occurrence('parent', composer()) + section('<div data-chat-running>Working</div>', 'settling')), { action: 'inspect' });
+  assert.deepEqual(live.snapshot.subagents.map(agent => [agent.status, agent.running, agent.loaded]), [['running', true, false]]);
 });
