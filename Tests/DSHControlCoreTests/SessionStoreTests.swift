@@ -47,6 +47,33 @@ private func answer(_ body: String, turn: Double = 1, interrupted: Bool = false)
     if interrupted { data["interrupted"] = .bool(true) }
     return .object(data)
 }
+private func humanTurn(_ turn: Double, id: String, reply: String, reason: String? = "completed") -> [(String, JSONValue)] {
+    var events: [(String, JSONValue)] = [
+        ("turn/start", .object(["turn": .number(turn)])),
+        ("user/message", human(id, "question " + id)),
+        ("assistant/message", answer(reply, turn: turn))
+    ]
+    if let reason { events.append(("turn/end", .object(["turn": .number(turn), "reason": .object(["kind": .string(reason)])]))) }
+    return events
+}
+/// An autonomous parent continuation turn: its input is agent-sourced, never a human request.
+private func continuation(_ turn: Double, id: String, reply: String?, reason: String? = "completed", interrupted: Bool = false) -> [(String, JSONValue)] {
+    let assistant: JSONValue
+    if let reply { assistant = answer(reply, turn: turn, interrupted: interrupted) }
+    else {
+        assistant = .object(["turn": .number(turn), "step": .number(1), "stream": .array([]),
+            "message": .object(["role": .string("assistant"), "source": .object(["kind": .string("model")]), "id": .string("assistant"),
+                                "content": .array([.object(["type": .string("reasoning"), "text": .string("PRIVATE")])])])])
+    }
+    var events: [(String, JSONValue)] = [
+        ("turn/start", .object(["turn": .number(turn)])),
+        ("user/message", .object(["role": .string("user"), "id": .string(id), "source": .object(["kind": .string("agent")]),
+                                  "content": .array([.object(["type": .string("text"), "text": .string("child report")])])])),
+        ("assistant/message", assistant)
+    ]
+    if let reason { events.append(("turn/end", .object(["turn": .number(turn), "reason": .object(["kind": .string(reason)])]))) }
+    return events
+}
 
 @Test func sessionStorePhysicalV4AdmissionAndLifecycle() throws {
     let fixture = try StoreFixture(); defer { fixture.cleanup() }
@@ -255,6 +282,175 @@ private func rawZstdFrame(_ input: Data) -> Data {
     #expect(partial["messages"]?.array?.first?["text"] == .string("PARTIAL"))
     #expect(partial["messages"]?.array?.first?["interrupted"] == .bool(true))
     #expect(partial["selectedTurn"]?["reason"]?["kind"] == .string("aborted"))
+}
+
+@Test func sessionStoreDefaultReadReturnsLatestCompletedContinuationReply() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "INITIAL") +
+                      continuation(2, id: "child-1", reply: "CONTINUATION-1") +
+                      continuation(3, id: "child-2", reply: "CONTINUATION-2"))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(3))
+    #expect(result["selectedTurn"]?["reason"]?["kind"] == .string("completed"))
+    #expect(result["messages"]?.array?.count == 1)
+    #expect(result["messages"]?.array?.first?["text"] == .string("CONTINUATION-2"))
+    #expect(result["messages"]?.array?.first?["turn"] == .number(3))
+    #expect(result["originalTurn"] == .number(1))
+    #expect(result["inputId"] == .string("request-a"))
+    #expect(result["replyAvailable"] == .bool(true))
+    #expect(!(try String(decoding: result.encoded(), as: UTF8.self)).contains("PRIVATE"))
+    // Explicit turns remain exact and never follow forward.
+    let initial = try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(1))
+    #expect(initial["selectedTurn"]?["turn"] == .number(1))
+    #expect(initial["messages"]?.array?.first?["text"] == .string("INITIAL"))
+    let continuationReply = try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(3))
+    #expect(continuationReply["selectedTurn"]?["turn"] == .number(3))
+    #expect(continuationReply["messages"]?.array?.first?["text"] == .string("CONTINUATION-2"))
+}
+
+@Test func sessionStoreDefaultReadChoosesLatestHumanEpisodeNotPriorReply() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "A-INITIAL") +
+                      continuation(2, id: "a-child", reply: "A-CONTINUATION") +
+                      humanTurn(3, id: "request-b", reply: "B-INITIAL") +
+                      continuation(4, id: "b-child-1", reply: "B-CONTINUATION-1") +
+                      continuation(5, id: "b-child-2", reply: "B-CONTINUATION-2"))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(5))
+    #expect(result["messages"]?.array?.first?["text"] == .string("B-CONTINUATION-2"))
+    #expect(result["originalTurn"] == .number(3))
+    #expect(result["inputId"] == .string("request-b"))
+    // The prior episode is never attributed to the newer human input.
+    #expect(try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(2))["messages"]?.array?.first?["text"] == .string("A-CONTINUATION"))
+    #expect(try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(3))["messages"]?.array?.first?["text"] == .string("B-INITIAL"))
+}
+
+@Test func sessionStoreDefaultReadKeepsUnfinishedContinuationVisible() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "INITIAL") +
+                      continuation(2, id: "child-done", reply: "DONE") +
+                      continuation(3, id: "child-open", reply: "PARTIAL", reason: nil))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(2))
+    #expect(result["messages"]?.array?.first?["text"] == .string("DONE"))
+    #expect(result["originalTurn"] == .number(1))
+    #expect(result["inputId"] == .string("request-a"))
+    #expect(result["newerUnfinishedTurns"]?.array?.count == 1)
+    #expect(result["newerUnfinishedTurns"]?.array?.first?["turn"] == .number(3))
+    #expect(result["newerUnfinishedTurns"]?.array?.first?["ended"] == .bool(false))
+    // The unfinished continuation reply is never promoted above the completed reply.
+    #expect(!(result["messages"]?.array ?? []).contains { $0["text"] == .string("PARTIAL") })
+}
+
+@Test func sessionStoreDefaultReadNeverPromotesInterruptedOrFailedReplies() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "INITIAL") +
+                      continuation(2, id: "child-interrupted", reply: "INTERRUPTED-TEXT", reason: "interrupted", interrupted: true) +
+                      continuation(3, id: "child-failed", reply: "FAILED-TEXT", reason: "aborted"))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(1))
+    #expect(result["messages"]?.array?.first?["text"] == .string("INITIAL"))
+    #expect(result["originalTurn"] == .number(1))
+    #expect(result["inputId"] == .string("request-a"))
+    let interrupted = try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(2))
+    #expect(interrupted["messages"]?.array?.first?["text"] == .string("INTERRUPTED-TEXT"))
+    #expect(interrupted["messages"]?.array?.first?["interrupted"] == .bool(true))
+    let failed = try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(3))
+    #expect(failed["messages"]?.array?.first?["text"] == .string("FAILED-TEXT"))
+    #expect(failed["selectedTurn"]?["reason"]?["kind"] == .string("aborted"))
+}
+
+@Test func sessionStoreDefaultReadWithoutEligibleTextKeepsRecordedOrigin() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "") + continuation(2, id: "child-empty", reply: nil))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(1))
+    #expect(result["messages"] == .array([]))
+    #expect(result["replyAvailable"] == .bool(false))
+    #expect(result["originalTurn"] == .number(1))
+    #expect(result["inputId"] == .string("request-a"))
+    #expect(!(try String(decoding: result.encoded(), as: UTF8.self)).contains("PRIVATE"))
+}
+
+@Test func sessionStoreDefaultReadRequiresHumanAnchorBeforeTheReply() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    // A completed human-origin turn can record assistant text before its own human input was admitted.
+    let chronology: [(String, JSONValue)] = [
+        ("turn/start", .object(["turn": .number(1)])),
+        ("assistant/message", answer("BEFORE_HUMAN", turn: 1)),
+        ("user/message", human("late-input", "late question")),
+        ("turn/end", .object(["turn": .number(1), "reason": .object(["kind": .string("completed")])]))
+    ]
+    try fixture.write(chronology)
+    let unanchored = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(unanchored["messages"] == .array([]))
+    #expect(unanchored["replyAvailable"] == .bool(false))
+    #expect(unanchored["selectedTurn"]?["turn"] == .number(1))
+    #expect(unanchored["originalTurn"] == .number(1))
+    #expect(unanchored["inputId"] == .string("late-input"))
+    // Explicit turns still return the record exactly as recorded.
+    let explicit = try fixture.store.read(sessionID: "scratch", lastAssistant: true, turn: .number(1))
+    #expect(explicit["messages"]?.array?.first?["text"] == .string("BEFORE_HUMAN"))
+    // A later autonomous continuation was recorded after the human input and is attributable to it.
+    try fixture.write(chronology + continuation(2, id: "child", reply: "AFTER_HUMAN"))
+    let anchored = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(anchored["selectedTurn"]?["turn"] == .number(2))
+    #expect(anchored["messages"]?.array?.count == 1)
+    #expect(anchored["messages"]?.array?.first?["text"] == .string("AFTER_HUMAN"))
+    #expect(anchored["messages"]?.array?.first?["turn"] == .number(2))
+    #expect(anchored["originalTurn"] == .number(1))
+    #expect(anchored["inputId"] == .string("late-input"))
+    #expect(anchored["replyAvailable"] == .bool(true))
+}
+
+@Test func sessionStoreDefaultReadSeededHistoryHasNoFabricatedOrigin() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write([
+        ("turn/start", try object(#"{"turn":1}"#)), ("user/message", human("ancestor", "inherited")),
+        ("assistant/message", answer("ancestor reply")),
+        ("turn/end", try object(#"{"turn":1,"reason":{"kind":"completed"}}"#)),
+        ("session/end-seed", try object(#"{"inherited":true}"#))
+    ], seeded: true, parent: "missing-ancestor")
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"] == .null)
+    #expect(result["messages"] == .array([]))
+    #expect(result["replyAvailable"] == .bool(false))
+    #expect(result["originalTurn"] == .null)
+    #expect(result["inputId"] == .null)
+    #expect(result["newerUnfinishedTurns"] == .array([]))
+}
+
+@Test func sessionStoreDefaultReadAttributesSharedTurnToMostRecentInput() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write([
+        ("turn/start", try object(#"{"turn":1}"#)),
+        ("user/message", human("first-input", "first")),
+        ("user/message", human("second-input", "second")),
+        ("assistant/message", answer("ANSWER", turn: 1)),
+        ("turn/end", try object(#"{"turn":1,"reason":{"kind":"completed"}}"#))
+    ] + continuation(2, id: "child", reply: "CONTINUATION"))
+    let result = try fixture.store.read(sessionID: "scratch", lastAssistant: true, full: true)
+    #expect(result["selectedTurn"]?["turn"] == .number(2))
+    #expect(result["originalTurn"] == .number(1))
+    #expect(result["inputId"] == .string("second-input"))
+}
+
+@Test func sessionStoreContinuationSelectionRespectsSinceRange() throws {
+    let fixture = try StoreFixture(); defer { fixture.cleanup() }
+    try fixture.write(humanTurn(1, id: "request-a", reply: "INITIAL"))
+    let before = try #require(try fixture.store.snapshot(sessionID: "scratch")["cursor"]?.string)
+    try fixture.write(humanTurn(1, id: "request-a", reply: "INITIAL") + continuation(2, id: "child", reply: "CONTINUATION"))
+    let ranged = try fixture.store.read(sessionID: "scratch", lastAssistant: true, since: before, full: true)
+    #expect(ranged["selectedTurn"]?["turn"] == .number(2))
+    #expect(ranged["messages"]?.array?.first?["text"] == .string("CONTINUATION"))
+    #expect(ranged["originalTurn"] == .number(1))
+    #expect(ranged["inputId"] == .string("request-a"))
+    #expect(ranged["replyAvailable"] == .bool(true))
+    let end = try #require(try fixture.store.snapshot(sessionID: "scratch")["cursor"]?.string)
+    let after = try fixture.store.read(sessionID: "scratch", lastAssistant: true, since: end, full: true)
+    #expect(after["selectedTurn"]?["turn"] == .number(2))
+    #expect(after["messages"] == .array([]))
+    #expect(after["replyAvailable"] == .bool(false))
 }
 
 @Test func sessionStoreAdmissionReferencesRequireStructuredFileAndPreserveHash() throws {

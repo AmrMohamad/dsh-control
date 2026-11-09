@@ -131,17 +131,31 @@ public struct SessionStore: Sendable {
         let log = try load(sessionID: sessionID)
         let count = try since.map { try cursorCount(.string($0), in: log) } ?? 0
         var result = try project(log)
-        var messages = result["messages"]!.array!.filter {
+        let projectedMessages = result["messages"]!.array!
+        var messages = projectedMessages.filter {
             ($0["eventSeq"]?.number ?? -1) >= Double(count) && (turn == nil || $0["turn"] == turn)
         }
         if lastAssistant {
-            let humanTurns = Set(result["messages"]!.array!.filter { $0["kind"]?.string == "user" }.compactMap { $0["turn"]?.number })
-            let completed = result["turns"]!.array!.filter { $0["reason"]?["kind"]?.string == "completed" && humanTurns.contains($0["turn"]?.number ?? -1) }
-            let selected = turn.flatMap { requested in result["turns"]!.array!.first { $0["turn"] == requested } } ?? (turn == nil ? completed.last : nil)
-            let selectedTurn = selected?["turn"]
-            messages = selectedTurn.map { selected in Array(messages.filter { $0["kind"]?.string == "assistant" && $0["turn"] == selected && (turn != nil || $0["interrupted"] != .bool(true)) && !($0["text"]?.string ?? "").isEmpty }.suffix(1)) } ?? []
-            result["selectedTurn"] = selected ?? .null
+            let choice: (selected: JSONValue?, reply: JSONValue?, origin: Double?, input: String?)
+            if let requested = turn {
+                // An explicit turn is exact: it never follows forward to a continuation turn.
+                choice = (result["turns"]!.array!.first { $0["turn"] == requested }, nil, nil, nil)
+            } else {
+                choice = latestReply(messages: projectedMessages, turns: result["turns"]!.array!)
+            }
+            let selectedTurn = choice.selected?["turn"]
+            messages = selectedTurn.map { selected in Array(messages.filter { message in
+                message["kind"]?.string == "assistant" && message["turn"] == selected
+                    && (turn != nil || message["interrupted"] != .bool(true))
+                    && !(message["text"]?.string ?? "").isEmpty
+                    && (turn != nil || message["eventSeq"] == choice.reply?["eventSeq"])
+            }.suffix(1)) } ?? []
+            result["selectedTurn"] = choice.selected ?? .null
             result["replyAvailable"] = .bool(!messages.isEmpty)
+            if turn == nil {
+                result["originalTurn"] = choice.origin.map { .number($0) } ?? .null
+                result["inputId"] = choice.input.map { .string($0) } ?? .null
+            }
             let selectedNumber = selectedTurn?.number ?? -1
             result["newerUnfinishedTurns"] = .array(result["turns"]!.array!.filter {
                 ($0["turn"]?.number ?? -1) > selectedNumber && $0["ended"] == .bool(false)
@@ -158,6 +172,46 @@ public struct SessionStore: Sendable {
         }
         result["messages"] = .array(messages)
         return .object(result)
+    }
+
+    /// Default `--last-assistant` selection: the latest eligible recorded reply in the episode opened
+    /// by the latest completed human-origin turn. Its autonomous parent continuation turns belong to
+    /// the same episode until the next human-origin turn starts another request. Selection uses IDs
+    /// and event order only; a reply is eligible when it is non-interrupted assistant text on a
+    /// completed turn and is preceded by an own human input from the origin turn. Without an
+    /// attributable reply the origin turn stays selected with empty output, matching exact reads.
+    private func latestReply(messages: [JSONValue], turns: [JSONValue]) -> (selected: JSONValue?, reply: JSONValue?, origin: Double?, input: String?) {
+        let human = messages.filter { $0["kind"]?.string == "user" && $0["turn"]?.number != nil && $0["inputId"]?.string != nil }
+        let humanTurns = Set(human.compactMap { $0["turn"]?.number })
+        let ordered = turns.sorted { ($0["turn"]?.number ?? -1) < ($1["turn"]?.number ?? -1) }
+        guard let originRow = ordered.last(where: { $0["reason"]?["kind"]?.string == "completed" && humanTurns.contains($0["turn"]?.number ?? -1) }),
+              let origin = originRow["turn"]?.number else { return (nil, nil, nil, nil) }
+        let boundary = ordered.compactMap { row -> Double? in
+            guard let number = row["turn"]?.number, number > origin, humanTurns.contains(number) else { return nil }
+            return number
+        }.min()
+        let episode = ordered.filter {
+            guard let number = $0["turn"]?.number else { return false }
+            return number >= origin && (boundary.map { number < $0 } ?? true)
+        }
+        let inputs = human.filter { $0["turn"]?.number == origin }
+        var selected: JSONValue?
+        var reply: JSONValue?
+        for row in episode where row["reason"]?["kind"]?.string == "completed" {
+            guard let message = messages.last(where: { $0["kind"]?.string == "assistant" && $0["turn"] == row["turn"]
+                && $0["interrupted"] != .bool(true) && !($0["text"]?.string ?? "").isEmpty }) else { continue }
+            // A reply recorded before every origin-turn human input cannot be attributed to one.
+            guard inputs.contains(where: { ($0["eventSeq"]?.number ?? -1) <= (message["eventSeq"]?.number ?? -1) }) else { continue }
+            selected = row
+            reply = message
+        }
+        selected = selected ?? originRow
+        let anchor = reply.flatMap { message in
+            inputs.last { ($0["eventSeq"]?.number ?? -1) <= (message["eventSeq"]?.number ?? -1) }
+        }
+        // With no attributable reply, retain the episode's real origin input but never its text.
+        let input = (anchor ?? inputs.last)?["inputId"]?.string
+        return (selected, reply, origin, input)
     }
 
     /// Return filesystem tool metadata actually recorded for the selected turn; absence stays unavailable.
